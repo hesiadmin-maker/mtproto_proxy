@@ -381,7 +381,25 @@ parse_upstream_data(<<?TLS_START, _/binary>> = AllData,
             assert_protocol(mtp_fake_tls),
             <<Data:FullPacketSize/binary, Tail/binary>> = AllData,
             EffSecret = effective_secret(Data, Secret),
-            {ok, Response, Meta, TlsCodec} = mtp_fake_tls:from_client_hello(Data, EffSecret),
+            
+            %% ============================================================
+            %% NEW: Read allowed TLS domains from config
+            %% ============================================================
+            AllowedTlsDomains = application:get_env(?APP, allowed_tls_domains, []),
+            
+            %% ============================================================
+            %% NEW: Call from_client_hello with domain restriction
+            %% ============================================================
+            {ok, Response, Meta, TlsCodec} = 
+                case AllowedTlsDomains of
+                    [] ->
+                        %% No restriction - backward compatible
+                        mtp_fake_tls:from_client_hello(Data, EffSecret);
+                    _ ->
+                        %% Domain restriction enabled
+                        mtp_fake_tls:from_client_hello(Data, EffSecret, AllowedTlsDomains)
+                end,
+            
             maybe_check_replay_tls(Meta),
             check_tls_policy(Listener, Ip, Meta),
             Codec1 = mtp_codec:replace(tls, true, TlsCodec, Codec0),
@@ -521,6 +539,17 @@ attempt_fronting(tls_invalid_digest, _Extra,
                     skip
             end
     end;
+%% ============================================================
+%% NEW: Handle tls_domain_not_allowed error
+%% ============================================================
+attempt_fronting(tls_domain_not_allowed, Domain,
+                 #state{hello_acc = Acc, addr = {Ip, _}, listener = Listener} = S) ->
+    ?LOG_WARNING("Client tried to connect with unauthorized domain: ~s", [Domain]),
+    case application:get_env(?APP, domain_fronting, off) of
+        off -> skip;
+        Config ->
+            do_front(Domain, Config, Acc, Ip, Listener, S)
+    end;
 attempt_fronting(replay_session_detected, SniDomain,
                  #state{hello_acc = Acc, addr = {Ip, _}, listener = Listener} = S)
   when is_binary(SniDomain) ->
@@ -646,8 +675,7 @@ down_send(Packet, #state{down = Down, listener = Listener, dc_id = Dc} = S) ->
 
 handle_unknown_upstream(#state{down = Down, sock = USock, transport = UTrans} = S) ->
     %% there might be a race-condition between packets from upstream socket and
-    %% downstream's 'close_ext' message. Most likely because of slow up_send
-    ok = UTrans:close(USock),
+    %% downstream's 'close_ext' message. Most likely because of slow up_send    ok = UTrans:close(USock),
     receive
         {'$gen_cast', {close_ext, Down}} ->
             ?LOG_DEBUG("asked to close connection by downstream"),
