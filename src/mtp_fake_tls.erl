@@ -14,6 +14,7 @@
 -export([format_secret_base64/2,
          format_secret_hex/2]).
 -export([from_client_hello/2,
+         from_client_hello/3,
          derive_sni_secret/3,
          parse_sni/1,
          tls_decode_error_alert/0,
@@ -105,14 +106,78 @@ urlencode_digit($/) -> $_;
 urlencode_digit($+) -> $-;
 urlencode_digit(D)  -> D.
 
-%% Parse fake-TLS "ClientHello" packet and generate "ServerHello + ChangeCipher + ApplicationData"
--spec from_client_hello(binary(), binary()) ->
+%% ============================================================================
+%% @doc Check if a domain is allowed based on the allowed domains list.
+%% Supports exact match and wildcard patterns like "*.example.com".
+%% @end
+%% ============================================================================
+-spec is_domain_allowed(binary(), [binary()]) -> boolean().
+is_domain_allowed(_Domain, []) ->
+    %% Empty list means all domains are allowed (backward compatibility)
+    true;
+is_domain_allowed(Domain, AllowedDomains) ->
+    lists:any(fun(Allowed) ->
+        match_domain(Domain, Allowed)
+    end, AllowedDomains).
+
+-spec match_domain(binary(), binary()) -> boolean().
+match_domain(Domain, Allowed) ->
+    case Allowed of
+        <<"*.", Base/binary>> ->
+            %% wildcard: *.example.com matches sub.example.com but not example.com
+            Suffix = <<".", Base/binary>>,
+            SuffixLen = byte_size(Suffix),
+            DomLen = byte_size(Domain),
+            if
+                DomLen >= SuffixLen ->
+                    %% Check if Domain ends with Suffix
+                    EndPart = binary:part(Domain, {DomLen, -SuffixLen}),
+                    EndPart =:= Suffix;
+                true ->
+                    false
+            end;
+        _ ->
+            Domain =:= Allowed
+    end.
+
+%% ============================================================================
+%% @doc Parse fake-TLS "ClientHello" packet and generate "ServerHello + ChangeCipher + ApplicationData"
+%% This is the version WITH domain checking.
+%% @end
+%% ============================================================================
+-spec from_client_hello(binary(), binary(), [binary()]) ->
                                {ok, iodata(), meta(), codec()}.
-from_client_hello(Data, Secret) ->
+from_client_hello(Data, Secret, AllowedDomains) ->
     #client_hello{pseudorandom = ClientDigest,
                   session_id = SessionId,
                   extensions = Extensions} = CliHlo = parse_client_hello(Data),
     ?LOG_DEBUG("TLS ClientHello=~p", [CliHlo]),
+
+    %% Extract SNI domain
+    SniDomain = case lists:keyfind(?EXT_SNI, 1, Extensions) of
+        {_, [{?EXT_SNI_HOST_NAME, Domain}]} -> Domain;
+        _ -> undefined
+    end,
+
+    %% Check if domain is allowed
+    case SniDomain of
+        undefined ->
+            ?LOG_WARNING("TLS ClientHello has no SNI, rejecting"),
+            error({protocol_error, tls_no_sni});
+        _ ->
+            case is_domain_allowed(SniDomain, AllowedDomains) of
+                true ->
+                    ok;
+                false ->
+                    ?LOG_WARNING(
+                       "TLS ClientHello with unauthorized domain '~s'. "
+                       "Allowed domains: ~p",
+                       [SniDomain, AllowedDomains]),
+                    error({protocol_error, tls_domain_not_allowed, SniDomain})
+            end
+    end,
+
+    %% Continue with the regular TLS handshake
     ServerDigest = make_server_digest(Data, Secret),
     <<Zeroes:(?DIGEST_LEN - 4)/binary, Timestamp:32/unsigned-little>> = XoredDigest =
         crypto:exor(ClientDigest, ServerDigest),
@@ -133,13 +198,18 @@ from_client_hello(Data, Secret) ->
     Meta0 = #{session_id => SessionId,
               timestamp => Timestamp,
               client_digest => ClientDigest},
-    Meta = case lists:keyfind(?EXT_SNI, 1, Extensions) of
-               {_, [{?EXT_SNI_HOST_NAME, Domain}]} ->
-                       Meta0#{sni_domain => Domain};
-               _ ->
-                   Meta0
-           end,
+    Meta = Meta0#{sni_domain => SniDomain},
     {ok, Response, Meta, new()}.
+
+%% ============================================================================
+%% @doc Backward-compatible version without domain checking.
+%% Calls from_client_hello/3 with empty domain list (all domains allowed).
+%% @end
+%% ============================================================================
+-spec from_client_hello(binary(), binary()) ->
+                               {ok, iodata(), meta(), codec()}.
+from_client_hello(Data, Secret) ->
+    from_client_hello(Data, Secret, []).
 
 %% Extract the SNI domain from a raw ClientHello binary without validating the secret.
 %% Used for domain fronting: call this when from_client_hello/2 raises tls_invalid_digest,
