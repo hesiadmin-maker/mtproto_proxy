@@ -54,7 +54,8 @@
 -spec client_create(binary(), atom(), integer()) ->
     {binary(), {binary(), binary()}, {binary(), binary()}, codec()}.
 client_create(Secret, Protocol, DcId) ->
-    client_create(crypto:strong_rand_bytes(?SEED_SIZE), Secret, Protocol, DcId, #{}).
+    Seed = crypto:strong_rand_bytes(?SEED_SIZE),
+    client_create(Seed, Secret, Protocol, DcId, #{}).
 
 %% @doc Creates a new obfuscated client with custom seed
 -spec client_create(binary(), binary(), atom(), integer()) ->
@@ -66,14 +67,8 @@ client_create(Seed, Secret, Protocol, DcId) ->
 %% Options:
 %%   - padding_enabled: boolean() - enable/disable random padding (default: true)
 %%   - tls_simulation: boolean() - enable TLS-like traffic patterns (default: false)
-%%   - min_padding: integer() - minimum padding bytes (default: 4)
-%%   - max_padding: integer() - maximum padding bytes (default: 32)
 -spec client_create(binary(), binary(), atom(), integer(), map()) ->
     {binary(), {binary(), binary()}, {binary(), binary()}, codec()}.
-client_create(HexSecret, Protocol, DcId, Options) when byte_size(HexSecret) == 32 ->
-    client_create(crypto:strong_rand_bytes(?SEED_SIZE), 
-                  mtp_handler:unhex(HexSecret), 
-                  Protocol, DcId, Options);
 client_create(Seed, Secret, Protocol, DcId, Options) 
     when byte_size(Seed) == ?SEED_SIZE,
          byte_size(Secret) == ?SECRET_SIZE,
@@ -86,14 +81,14 @@ client_create(Seed, Secret, Protocol, DcId, Options)
     DcIdBin = encode_dc_id(DcId),
     Raw = <<L:56/binary, ProtocolBin:4/binary, DcIdBin:2/binary, R:2/binary>>,
 
-    %% Generate keys with enhanced entropy
+    %% Generate keys
     {EncKey, EncIv, DecKey, DecIv} = generate_keys(Raw, Secret),
     
     %% Create codec with options
     Codec0 = new(EncKey, EncIv, DecKey, DecIv),
     Codec = apply_options(Codec0, Options),
     
-    %% Encrypt header with optional padding simulation
+    %% Encrypt header
     {EncryptedHeader, Codec1} = encrypt_header(Raw, Codec),
     
     {EncryptedHeader, 
@@ -177,13 +172,13 @@ encode_packet(Msg, St) ->
 %%% Internal functions
 %%%===================================================================
 
-%% @doc Generates encryption keys with enhanced entropy
+%% @doc Generates encryption keys
 generate_keys(Raw, Secret) ->
-    %% Encryption key (for client -> server)
+    %% Decryption key (for server -> client)
     <<_:8/binary, DecKeySeed:?KEY_LEN/binary, DecIv:?IV_LEN/binary, _/binary>> = Raw,
     DecKey = crypto:hash('sha256', <<DecKeySeed:?KEY_LEN/binary, Secret:16/binary>>),
     
-    %% Decryption key (for server -> client)
+    %% Encryption key (for client -> server)
     <<_:8/binary, EncKeySeed:?KEY_LEN/binary, EncIv:?IV_LEN/binary, _/binary>> = Raw,
     EncKey = crypto:hash('sha256', <<EncKeySeed:?KEY_LEN/binary, Secret:16/binary>>),
     
@@ -287,11 +282,11 @@ apply_options(Codec, Options) ->
         tls_simulation = TLSSimulation
     }.
 
-%% @doc Encrypts header with optional DPI resistance
+%% @doc Encrypts header
 encrypt_header(Raw, #st{encrypt = Enc} = St) ->
     {Enc1, Encrypted} = crypto_stream_encrypt(Enc, Raw),
     
-    %% Extract encrypted portion
+    %% Extract encrypted portion (last 8 bytes)
     <<RawL:56/binary, EncryptedPart:8/binary>> = Encrypted,
     
     %% Construct final header
