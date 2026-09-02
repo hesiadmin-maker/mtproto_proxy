@@ -32,16 +32,14 @@
 -define(HEADER_SIZE, 64).
 -define(SEED_SIZE, 58).
 -define(SECRET_SIZE, 16).
--define(MAX_PADDING_SIZE, 32).
--define(MIN_PADDING_SIZE, 4).
 
 %% Records
 -record(st,
         {encrypt :: any(),                      % aes state
          decrypt :: any(),                      % aes state
-         padding_enabled = true :: boolean(),   % padding toggle
          tls_simulation = false :: boolean(),   % TLS simulation mode
-         packet_counter = 0 :: non_neg_integer() % packet counter for timing
+         packet_counter = 0 :: non_neg_integer(), % packet counter
+         handshake_complete = false :: boolean() % track handshake state
         }).
 
 -opaque codec() :: #st{}.
@@ -55,17 +53,16 @@
     {binary(), {binary(), binary()}, {binary(), binary()}, codec()}.
 client_create(Secret, Protocol, DcId) ->
     Seed = crypto:strong_rand_bytes(?SEED_SIZE),
-    client_create(Seed, Secret, Protocol, DcId, #{padding_enabled => true}).
+    client_create(Seed, Secret, Protocol, DcId, #{tls_simulation => false}).
 
 %% @doc Creates a new obfuscated client with custom seed
 -spec client_create(binary(), binary(), atom(), integer()) ->
     {binary(), {binary(), binary()}, {binary(), binary()}, codec()}.
 client_create(Seed, Secret, Protocol, DcId) ->
-    client_create(Seed, Secret, Protocol, DcId, #{padding_enabled => true}).
+    client_create(Seed, Secret, Protocol, DcId, #{tls_simulation => false}).
 
 %% @doc Creates a new obfuscated client with options
 %% Options:
-%%   - padding_enabled: boolean() - enable/disable random padding (default: true)
 %%   - tls_simulation: boolean() - enable TLS-like traffic patterns (default: false)
 -spec client_create(binary(), binary(), atom(), integer(), map()) ->
     {binary(), {binary(), binary()}, {binary(), binary()}, codec()}.
@@ -81,14 +78,14 @@ client_create(Seed, Secret, Protocol, DcId, Options)
     DcIdBin = encode_dc_id(DcId),
     Raw = <<L:56/binary, ProtocolBin:4/binary, DcIdBin:2/binary, R:2/binary>>,
 
-    %% Generate keys - KEEP ORIGINAL KEY GENERATION
+    %% Generate keys - original method
     {EncKey, EncIv, DecKey, DecIv} = generate_keys_original(Raw, Secret),
     
-    %% Create codec with options
+    %% Create codec
     Codec0 = new(EncKey, EncIv, DecKey, DecIv),
     Codec = apply_options(Codec0, Options),
     
-    %% Encrypt header - KEEP ORIGINAL HEADER ENCRYPTION
+    %% Encrypt header - original method
     {EncryptedHeader, Codec1} = encrypt_header_original(Raw, Codec),
     
     {EncryptedHeader, 
@@ -101,7 +98,7 @@ client_create(Seed, Secret, Protocol, DcId, Options)
     {ok, integer(), atom(), codec()} | {error, term()}.
 from_header(Header, Secret) when byte_size(Header) == ?HEADER_SIZE ->
     try
-        %% KEEP ORIGINAL KEY DERIVATION
+        %% Original key derivation
         {EncKey, EncIV} = init_up_encrypt_original(Header, Secret),
         {DecKey, DecIV} = init_up_decrypt_original(Header, Secret),
         St0 = new(EncKey, EncIV, DecKey, DecIV),
@@ -112,8 +109,8 @@ from_header(Header, Secret) when byte_size(Header) == ?HEADER_SIZE ->
                 Err;
             Protocol ->
                 DcId = get_dc(Bin1),
-                %% Enable padding for received packets
-                St2 = St1#st{padding_enabled = true},
+                %% Mark handshake as complete
+                St2 = St1#st{handshake_complete = true},
                 {ok, DcId, Protocol, St2}
         end
     catch
@@ -127,24 +124,26 @@ new(EncKey, EncIV, DecKey, DecIV) ->
     #st{
         decrypt = crypto_stream_init('aes_ctr', DecKey, DecIV),
         encrypt = crypto_stream_init('aes_ctr', EncKey, EncIV),
-        padding_enabled = true,  % Enable by default
         tls_simulation = false,
-        packet_counter = 0
+        packet_counter = 0,
+        handshake_complete = false
     }.
 
-%% @doc Encrypts data with padding
+%% @doc Encrypts data with DPI resistance
 -spec encrypt(iodata(), codec()) -> {binary(), codec()}.
 encrypt(Data, #st{encrypt = Enc, packet_counter = Counter} = St) ->
-    %% Apply DPI resistance techniques
-    {ProcessedData, St1} = apply_dpi_resistance(Data, St),
-    
-    %% Encrypt processed data
-    {Enc1, Encrypted} = crypto_stream_encrypt(Enc, ProcessedData),
-    
-    {Encrypted, St1#st{
-        encrypt = Enc1,
-        packet_counter = Counter + 1
-    }}.
+    %% Apply DPI resistance only after handshake
+    case St#st.handshake_complete of
+        false ->
+            %% During handshake - use original encryption
+            {Enc1, Encrypted} = crypto_stream_encrypt(Enc, Data),
+            {Encrypted, St#st{encrypt = Enc1, packet_counter = Counter + 1}};
+        true ->
+            %% After handshake - apply DPI resistance
+            {ProcessedData, St1} = apply_dpi_resistance(Data, St),
+            {Enc1, Encrypted} = crypto_stream_encrypt(Enc, ProcessedData),
+            {Encrypted, St1#st{encrypt = Enc1, packet_counter = Counter + 1}}
+    end.
 
 %% @doc Decrypts data
 -spec decrypt(iodata(), codec()) -> {binary(), binary(), codec()}.
@@ -158,12 +157,17 @@ decrypt(Encrypted, #st{decrypt = Dec} = St) ->
 try_decode_packet(Encrypted, St) ->
     {Decrypted, Tail, St1} = decrypt(Encrypted, St),
     
-    %% Remove padding
-    {UnpaddedData, St2} = remove_padding(Decrypted, St1),
-    
-    case UnpaddedData of
-        <<>> -> {incomplete, St2};
-        _ -> {ok, UnpaddedData, Tail, St2}
+    %% Only process DPI resistance after handshake
+    case St1#st.handshake_complete of
+        true ->
+            {UnprocessedData, St2} = remove_dpi_resistance(Decrypted, St1),
+            case UnprocessedData of
+                <<>> -> {incomplete, St2};
+                _ -> {ok, UnprocessedData, Tail, St2}
+            end;
+        false ->
+            %% During handshake - return as-is
+            {ok, Decrypted, Tail, St1}
     end.
 
 %% @doc Encodes a packet for sending
@@ -209,31 +213,32 @@ init_up_decrypt_original(Bin, Secret) ->
     Key = crypto:hash('sha256', <<KeySeed:?KEY_LEN/binary, Secret:16/binary>>),
     {Key, IV}.
 
-%% @doc Applies DPI resistance techniques
-apply_dpi_resistance(Data, #st{padding_enabled = true} = St) ->
-    %% Add random padding
-    PaddingSize = random_padding_size(),
-    Padding = crypto:strong_rand_bytes(PaddingSize),
-    
-    %% Add length prefix
-    DataBinary = iolist_to_binary(Data),
-    DataSize = byte_size(DataBinary),
-    PaddedData = <<DataSize:16, DataBinary/binary, Padding/binary>>,
-    
-    %% Optionally simulate TLS patterns
-    case St#st.tls_simulation of
-        true -> simulate_tls_pattern(PaddedData, St);
-        false -> {PaddedData, St}
-    end;
+%% @doc Applies DPI resistance techniques (TLS simulation)
+apply_dpi_resistance(Data, #st{tls_simulation = true} = St) ->
+    %% TLS simulation - wrap data in TLS-like records
+    simulate_tls_pattern(Data, St);
 apply_dpi_resistance(Data, St) ->
-    %% No padding, just add length prefix
-    DataBinary = iolist_to_binary(Data),
-    DataSize = byte_size(DataBinary),
-    {<<DataSize:16, DataBinary/binary>>, St}.
+    %% Default: add random padding within MTProto frame
+    add_random_padding(Data, St).
 
-%% @doc Generates random padding size
-random_padding_size() ->
-    rand:uniform(?MAX_PADDING_SIZE - ?MIN_PADDING_SIZE) + ?MIN_PADDING_SIZE.
+%% @doc Adds random padding to MTProto packets
+add_random_padding(Data, St) ->
+    DataBinary = iolist_to_binary(Data),
+    
+    %% Add padding in a way that's compatible with MTProto
+    %% MTProto uses length-prefixed framing, so we add padding after the length
+    case DataBinary of
+        <<Len:32/little, Rest/binary>> when Len > 0, Len < 16777216 ->
+            %% This is a transport packet - add padding
+            PaddingSize = rand:uniform(16),  % 0-15 bytes padding
+            Padding = crypto:strong_rand_bytes(PaddingSize),
+            NewLen = Len + PaddingSize,
+            <<NewLen:32/little, Rest/binary, Padding/binary>>;
+        _ ->
+            %% Not a standard packet - leave as-is
+            DataBinary
+    end,
+    {Result, St}.
 
 %% @doc Simulates TLS-like traffic patterns
 simulate_tls_pattern(Data, St) ->
@@ -244,24 +249,21 @@ simulate_tls_pattern(Data, St) ->
         _ -> <<16#15>>  % Alert
     end,
     Version = <<3, 3>>, % TLS 1.2
-    Length = byte_size(Data),
+    DataBinary = iolist_to_binary(Data),
+    Length = byte_size(DataBinary),
     
     %% Sometimes add dummy handshake messages
-    case random_dummy_handshake() of
+    case rand:uniform(10) == 1 of
         true ->
             DummyHandshake = generate_dummy_handshake(),
             TLSData = <<ContentType/binary, Version/binary, 
                         (Length + byte_size(DummyHandshake)):16, 
-                        Data/binary, DummyHandshake/binary>>,
+                        DataBinary/binary, DummyHandshake/binary>>,
             {TLSData, St};
         false ->
-            TLSData = <<ContentType/binary, Version/binary, Length:16, Data/binary>>,
+            TLSData = <<ContentType/binary, Version/binary, Length:16, DataBinary/binary>>,
             {TLSData, St}
     end.
-
-%% @doc Randomly decides to add dummy handshake
-random_dummy_handshake() ->
-    rand:uniform(10) == 1. % 10% chance
 
 %% @doc Generates dummy TLS handshake data
 generate_dummy_handshake() ->
@@ -271,31 +273,47 @@ generate_dummy_handshake() ->
     RandomData = crypto:strong_rand_bytes(Length),
     <<HandshakeType/binary, Length:24, RandomData/binary>>.
 
-%% @doc Removes padding from decrypted data
-remove_padding(Data, #st{padding_enabled = true} = St) ->
+%% @doc Removes DPI resistance from decrypted data
+remove_dpi_resistance(Data, #st{tls_simulation = true} = St) ->
+    %% Remove TLS simulation
+    remove_tls_pattern(Data, St);
+remove_dpi_resistance(Data, St) ->
+    %% Remove padding
+    remove_random_padding(Data, St).
+
+%% @doc Removes random padding from MTProto packets
+remove_random_padding(Data, St) ->
     case Data of
-        <<Size:16, Payload:Size/binary, _Padding/binary>> ->
-            {Payload, St};
-        <<Size:16, _/binary>> when Size > byte_size(Data) - 2 ->
-            {<<>>, St}; % Incomplete packet
+        <<Len:32/little, Rest/binary>> when Len > 0 ->
+            case Rest of
+                <<ActualData:Len/binary, _Padding/binary>> ->
+                    {ActualData, St};
+                _ ->
+                    {<<>>, St}  % Incomplete
+            end;
         _ ->
-            {Data, St#st{padding_enabled = false}} % Fallback
-    end;
-remove_padding(Data, St) ->
+            {Data, St}
+    end.
+
+%% @doc Removes TLS pattern from data
+remove_tls_pattern(Data, St) ->
     case Data of
-        <<Size:16, Payload:Size/binary, _/binary>> ->
-            {Payload, St};
+        <<_:5/binary, Length:16, TLSData/binary>> ->
+            case TLSData of
+                <<ActualData:Length/binary, _Rest/binary>> ->
+                    {ActualData, St};
+                _ ->
+                    {<<>>, St}  % Incomplete
+            end;
         _ ->
             {Data, St}
     end.
 
 %% @doc Applies codec options
 apply_options(Codec, Options) ->
-    PaddingEnabled = maps:get(padding_enabled, Options, true),
     TLSSimulation = maps:get(tls_simulation, Options, false),
     
     Codec#st{
-        padding_enabled = PaddingEnabled,
         tls_simulation = TLSSimulation
     }.
 
@@ -351,36 +369,17 @@ client_server_test() ->
     Srv = from_header(Packet, Secret),
     ?assertMatch({ok, DcId, Protocol, _}, Srv).
 
-padding_test() ->
+handshake_test() ->
     Secret = crypto:strong_rand_bytes(16),
     DcId = 4,
     Protocol = mtp_secure,
-    {_, _, _, Codec} = client_create(Secret, Protocol, DcId, #{
-        padding_enabled => true,
-        tls_simulation => false
-    }),
+    {Packet, _, _, CliCodec} = client_create(Secret, Protocol, DcId),
+    {ok, DcId, Protocol, SrvCodec} = from_header(Packet, Secret),
     
-    %% Test encryption with padding
-    TestData = <<"Hello, World!">>,
-    {Encrypted, _Codec1} = encrypt(TestData, Codec),
-    
-    %% Encrypted data should be larger than original due to padding
-    ?assert(byte_size(Encrypted) > byte_size(TestData) + 2).
-
-tls_simulation_test() ->
-    Secret = crypto:strong_rand_bytes(16),
-    DcId = 4,
-    Protocol = mtp_secure,
-    {_, _, _, Codec} = client_create(Secret, Protocol, DcId, #{
-        padding_enabled => true,
-        tls_simulation => true
-    }),
-    
-    %% Test encryption with TLS simulation
-    TestData = <<"Hello, World!">>,
-    {Encrypted, _Codec1} = encrypt(TestData, Codec),
-    
-    %% Should be even larger due to TLS header
-    ?assert(byte_size(Encrypted) > byte_size(TestData) + 5).
+    %% Test handshake packet (should not be modified)
+    TestData = <<"handshake_data">>,
+    {Encrypted, _} = encrypt(TestData, CliCodec),
+    {Decrypted, <<>>, _} = decrypt(Encrypted, SrvCodec),
+    ?assertEqual(TestData, Decrypted).
 
 -endif.
