@@ -204,8 +204,9 @@ apply_dpi_resistance(Data, #st{padding_enabled = true} = St) ->
     Padding = crypto:strong_rand_bytes(PaddingSize),
     
     %% Add length prefix
-    DataSize = byte_size(iolist_to_binary(Data)),
-    PaddedData = <<DataSize:16, Data/binary, Padding/binary>>,
+    DataBinary = iolist_to_binary(Data),
+    DataSize = byte_size(DataBinary),
+    PaddedData = <<DataSize:16, DataBinary/binary, Padding/binary>>,
     
     %% Optionally simulate TLS patterns
     case St#st.tls_simulation of
@@ -214,8 +215,9 @@ apply_dpi_resistance(Data, #st{padding_enabled = true} = St) ->
     end;
 apply_dpi_resistance(Data, St) ->
     %% No padding, just add length prefix
-    DataSize = byte_size(iolist_to_binary(Data)),
-    {<<DataSize:16, Data/binary>>, St}.
+    DataBinary = iolist_to_binary(Data),
+    DataSize = byte_size(DataBinary),
+    {<<DataSize:16, DataBinary/binary>>, St}.
 
 %% @doc Generates random padding size
 random_padding_size() ->
@@ -291,7 +293,6 @@ encrypt_header(Raw, #st{encrypt = Enc} = St) ->
     
     %% Extract encrypted portion
     <<RawL:56/binary, EncryptedPart:8/binary>> = Encrypted,
-    <<_:56/binary, _:8/binary>> = Raw,
     
     %% Construct final header
     FinalHeader = <<RawL:56/binary, EncryptedPart:8/binary>>,
